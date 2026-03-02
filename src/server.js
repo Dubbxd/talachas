@@ -1364,6 +1364,28 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
   attachGatewayAuthHeader(req);
 });
 
+// Twilio webhook public endpoint (only this route).
+// Keeps dashboard auth enabled for everything else.
+app.post("/voice/webhook", async (req, res) => {
+  if (!isConfigured()) {
+    return res.status(503).type("text/plain").send("Gateway not configured");
+  }
+
+  try {
+    await ensureGatewayRunning();
+  } catch (err) {
+    return res.status(503).type("text/plain").send(`Gateway not ready: ${String(err)}`);
+  }
+
+  // Twilio status callbacks only need 2xx; no TwiML required.
+  if (String(req.query?.type || "") === "status") {
+    return res.status(204).end();
+  }
+
+  // Forward voice webhook traffic to the voice-call plugin listener.
+  return proxy.web(req, res, { target: "http://127.0.0.1:3334" });
+});
+
 app.use(requireDashboardAuth, async (req, res) => {
   // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
