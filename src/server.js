@@ -1367,6 +1367,7 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
 // Twilio webhook public endpoint (only this route).
 // Keeps dashboard auth enabled for everything else.
 // NOTE: status callbacks (?type=status) return 204 to prevent Twilio 15003 warnings.
+// Keep this route public and narrow to avoid dashboard auth interfering with Twilio callbacks.
 app.post("/voice/webhook", async (req, res) => {
   if (!isConfigured()) {
     return res.status(503).type("text/plain").send("Gateway not configured");
