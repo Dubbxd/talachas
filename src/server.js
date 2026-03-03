@@ -298,6 +298,7 @@ function requireSetupAuth(req, res, next) {
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false, limit: "1mb" }));
 
 // Minimal health endpoint for Railway.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
@@ -1364,6 +1365,179 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
   attachGatewayAuthHeader(req);
 });
 
+function normalizeE164(raw) {
+  const s = String(raw || "").trim().replace(/^whatsapp:/i, "");
+  if (!s) return null;
+  if (!/^\+[1-9]\d{7,14}$/.test(s)) return null;
+  return s;
+}
+
+const WA_COMMANDS_ENABLED = String(process.env.WA_COMMANDS_ENABLED || "false").toLowerCase() === "true";
+const WA_COMMAND_PREFIX = (process.env.WA_COMMAND_PREFIX || "Fred").trim();
+const WA_OWNER_E164 = normalizeE164(process.env.WA_OWNER_E164 || "");
+const WA_AUDIT_LOG_PATH =
+  process.env.WA_AUDIT_LOG_PATH?.trim() || path.join(STATE_DIR, "wa-command-audit.log");
+
+function waAudit(entry) {
+  const record = {
+    ts: new Date().toISOString(),
+    ...entry,
+  };
+  try {
+    fs.mkdirSync(path.dirname(WA_AUDIT_LOG_PATH), { recursive: true });
+    fs.appendFileSync(WA_AUDIT_LOG_PATH, `${JSON.stringify(record)}\n`, "utf8");
+  } catch {
+    // best-effort
+  }
+}
+
+function waCommandTextFromBody(body) {
+  return String(
+    body?.text ?? body?.body ?? body?.message ?? body?.Body ?? body?.Message ?? "",
+  ).trim();
+}
+
+function waSenderFromBody(body) {
+  return normalizeE164(
+    body?.owner ?? body?.author ?? body?.from ?? body?.From ?? body?.sender ?? body?.remoteJid ?? "",
+  );
+}
+
+function parseFredCommand(text) {
+  const t = String(text || "").trim();
+  if (!t) return { ok: false, reason: "empty" };
+
+  const prefixRegex = new RegExp(`^${WA_COMMAND_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+  if (!prefixRegex.test(t)) return { ok: false, reason: "prefix_mismatch" };
+
+  const cmd = t.replace(prefixRegex, "").trim();
+  if (!cmd) return { ok: false, reason: "empty_after_prefix" };
+
+  const sendMatch = cmd.match(/^send\s+([^|\s]+)\s*\|\s*(.+)$/i);
+  if (sendMatch) {
+    const to = normalizeE164(sendMatch[1]);
+    const message = sendMatch[2]?.trim();
+    if (!to || !message) return { ok: false, reason: "invalid_send_args" };
+    return { ok: true, action: "send", to, message };
+  }
+
+  const callMatch = cmd.match(/^call\s+([^\s]+)$/i);
+  if (callMatch) {
+    const to = normalizeE164(callMatch[1]);
+    if (!to) return { ok: false, reason: "invalid_call_target" };
+    return { ok: true, action: "call", to };
+  }
+
+  const endCallMatch = cmd.match(/^(?:endcall|hangup)\s+([A-Za-z0-9]+)$/i);
+  if (endCallMatch) {
+    return { ok: true, action: "endcall", callSid: endCallMatch[1] };
+  }
+
+  return { ok: false, reason: "unknown_command" };
+}
+
+async function twilioRequest(pathname, params) {
+  const sid = process.env.TWILIO_ACCOUNT_SID?.trim();
+  const token = process.env.TWILIO_AUTH_TOKEN?.trim();
+  if (!sid || !token) throw new Error("Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
+
+  const body = new URLSearchParams(params);
+  const auth = Buffer.from(`${sid}:${token}`).toString("base64");
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/${pathname}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body,
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Twilio ${pathname} failed (${res.status}): ${text.slice(0, 500)}`);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
+}
+
+async function executeFredCommand(parsed) {
+  if (parsed.action === "send") {
+    const from = normalizeE164(process.env.TWILIO_WHATSAPP_FROM || "");
+    if (!from) throw new Error("Missing/invalid TWILIO_WHATSAPP_FROM (E.164)");
+
+    const r = await twilioRequest("Messages.json", {
+      To: `whatsapp:${parsed.to}`,
+      From: `whatsapp:${from}`,
+      Body: parsed.message,
+    });
+    return { action: "send", sid: r.sid || null, to: parsed.to };
+  }
+
+  if (parsed.action === "call") {
+    const from = normalizeE164(process.env.TWILIO_VOICE_FROM || "");
+    if (!from) throw new Error("Missing/invalid TWILIO_VOICE_FROM (E.164)");
+
+    const twiml = "<Response><Say language=\"es-ES\">Llamada iniciada por comando Fred.</Say></Response>";
+    const r = await twilioRequest("Calls.json", {
+      To: parsed.to,
+      From: from,
+      Twiml: twiml,
+    });
+    return { action: "call", sid: r.sid || null, to: parsed.to };
+  }
+
+  if (parsed.action === "endcall") {
+    const r = await twilioRequest(`Calls/${parsed.callSid}.json`, {
+      Status: "completed",
+    });
+    return { action: "endcall", sid: r.sid || parsed.callSid };
+  }
+
+  throw new Error(`Unsupported action: ${parsed.action}`);
+}
+
+// Public WhatsApp command webhook:
+// executes owner-only commands sent from the same WhatsApp account (fromMe=true).
+// Unknown/invalid commands are safe no-op (204).
+app.post("/whatsapp/webhook", async (req, res) => {
+  if (!WA_COMMANDS_ENABLED) return res.status(204).end();
+
+  const body = req.body || {};
+  const fromMe = body?.fromMe === true || String(body?.fromMe || "").toLowerCase() === "true";
+  const sender = waSenderFromBody(body);
+  const text = waCommandTextFromBody(body);
+
+  if (!fromMe) {
+    waAudit({ scope: "fred", accepted: false, reason: "not_from_me", sender, textPreview: text.slice(0, 120) });
+    return res.status(204).end();
+  }
+
+  if (!WA_OWNER_E164 || sender !== WA_OWNER_E164) {
+    waAudit({ scope: "fred", accepted: false, reason: "owner_mismatch", sender, textPreview: text.slice(0, 120) });
+    return res.status(204).end();
+  }
+
+  const parsed = parseFredCommand(text);
+  if (!parsed.ok) {
+    waAudit({ scope: "fred", accepted: false, reason: parsed.reason, sender, textPreview: text.slice(0, 120) });
+    return res.status(204).end();
+  }
+
+  try {
+    const result = await executeFredCommand(parsed);
+    waAudit({ scope: "fred", accepted: true, sender, command: parsed.action, result });
+  } catch (err) {
+    waAudit({ scope: "fred", accepted: false, sender, command: parsed.action, reason: "execution_error", error: String(err) });
+  }
+
+  return res.status(204).end();
+});
+
 // Twilio webhook public endpoint (only this route).
 // Keeps dashboard auth enabled for everything else.
 // NOTE: status callbacks (?type=status) return 204 to prevent Twilio 15003 warnings.
@@ -1429,6 +1603,10 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 
   console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
   console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
+  console.log(`[wrapper] wa commands: ${WA_COMMANDS_ENABLED ? "enabled" : "disabled"}, prefix=${WA_COMMAND_PREFIX}`);
+  if (WA_COMMANDS_ENABLED && !WA_OWNER_E164) {
+    console.warn("[wrapper] WARNING: WA_COMMANDS_ENABLED=true but WA_OWNER_E164 is missing/invalid. Commands will be ignored.");
+  }
   if (!SETUP_PASSWORD) {
     console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
   }

@@ -105,6 +105,36 @@ python3 -m venv /data/venv || true
 mkdir -p /data/npm /data/npm-cache /data/pnpm /data/pnpm-store
 ```
 
+## Comandos WhatsApp del dueño (prefijo `Fred`)
+
+Este wrapper incluye un middleware de orquestación para ejecutar acciones cuando llega un webhook de WhatsApp con:
+- `fromMe=true`
+- remitente igual al dueño (`WA_OWNER_E164`)
+- mensaje con prefijo `Fred` (o el definido)
+
+Endpoint público:
+- `POST /whatsapp/webhook`
+
+Variables nuevas (Railway):
+- `WA_COMMANDS_ENABLED=true`
+- `WA_COMMAND_PREFIX=Fred`
+- `WA_OWNER_E164=+34600111222` (formato E.164 estricto)
+- `WA_AUDIT_LOG_PATH=/data/.openclaw/wa-command-audit.log` (opcional)
+- `TWILIO_ACCOUNT_SID=...`
+- `TWILIO_AUTH_TOKEN=...`
+- `TWILIO_WHATSAPP_FROM=+14155238886` (número WhatsApp Twilio)
+- `TWILIO_VOICE_FROM=+12025550123` (caller id para llamadas)
+
+Comandos soportados:
+- `Fred send +34600111222 | Hola desde Fred`
+- `Fred call +34600111222`
+- `Fred endcall CA1234567890abcdef...` (o `Fred hangup <CallSid>`)
+
+Comportamiento de seguridad:
+- Si no cumple owner/prefijo/formato: **no-op seguro** (`204`)
+- Comando desconocido: **no-op seguro** (`204`)
+- Todo intento queda auditado en JSONL en `WA_AUDIT_LOG_PATH`
+
 ## Troubleshooting
 
 ### “disconnected (1008): pairing required” / dashboard health offline
