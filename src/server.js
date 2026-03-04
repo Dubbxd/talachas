@@ -1566,7 +1566,8 @@ async function executeFredGlobalConversation(prompt, target) {
 }
 
 // Public WhatsApp command webhook:
-// executes owner-only commands sent from the same WhatsApp account (fromMe=true).
+// executes owner-only commands from owner-authored events.
+// Supports providers where fromMe may be missing by falling back to owner sender match.
 // Unknown/invalid commands are safe no-op (204).
 app.post("/whatsapp/webhook", async (req, res) => {
   if (!WA_COMMANDS_ENABLED) return res.status(204).end();
@@ -1576,12 +1577,15 @@ app.post("/whatsapp/webhook", async (req, res) => {
   const sender = waSenderFromBody(body);
   const text = waCommandTextFromBody(body);
 
-  if (!fromMe) {
-    waAudit({ scope: "fred", accepted: false, reason: "not_from_me", sender, textPreview: text.slice(0, 120) });
+  // Some providers/webhooks don't reliably set fromMe for owner-sent DMs.
+  // Accept either explicit fromMe OR owner sender match.
+  const ownerMatch = Boolean(WA_OWNER_E164 && sender === WA_OWNER_E164);
+  if (!fromMe && !ownerMatch) {
+    waAudit({ scope: "fred", accepted: false, reason: "not_owner_or_fromMe", sender, textPreview: text.slice(0, 120) });
     return res.status(204).end();
   }
 
-  if (!WA_OWNER_E164 || sender !== WA_OWNER_E164) {
+  if (!ownerMatch) {
     waAudit({ scope: "fred", accepted: false, reason: "owner_mismatch", sender, textPreview: text.slice(0, 120) });
     return res.status(204).end();
   }
