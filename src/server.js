@@ -1366,12 +1366,16 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
 });
 
 function normalizeE164(raw) {
-  const s = String(raw || "").trim().replace(/^whatsapp:/i, "");
+  let s = String(raw || "").trim().replace(/^whatsapp:/i, "");
   if (!s) return null;
+  // keep leading +, strip spaces/formatting
+  s = s.replace(/[()\-\s]/g, "");
+  // allow 00-prefix as international format
+  if (s.startsWith("00")) s = `+${s.slice(2)}`;
+  if (!s.startsWith("+")) return null;
   if (!/^\+[1-9]\d{7,14}$/.test(s)) return null;
   return s;
 }
-
 const WA_COMMANDS_ENABLED = String(process.env.WA_COMMANDS_ENABLED || "false").toLowerCase() === "true";
 const WA_COMMAND_PREFIX = (process.env.WA_COMMAND_PREFIX || "Fred").trim();
 const WA_OWNER_E164 = normalizeE164(process.env.WA_OWNER_E164 || "");
@@ -1413,29 +1417,48 @@ function parseFredCommand(text) {
   const cmd = t.replace(prefixRegex, "").trim();
   if (!cmd) return { ok: false, reason: "empty_after_prefix" };
 
-  const sendMatch = cmd.match(/^send\s+([^|\s]+)\s*\|\s*(.+)$/i);
-  if (sendMatch) {
-    const to = normalizeE164(sendMatch[1]);
-    const message = sendMatch[2]?.trim();
+  // English explicit send: Fred send +52... | mensaje
+  let m = cmd.match(/^send\s+([^|\s]+)\s*\|\s*(.+)$/i);
+  if (m) {
+    const to = normalizeE164(m[1]);
+    const message = m[2]?.trim();
     if (!to || !message) return { ok: false, reason: "invalid_send_args" };
     return { ok: true, action: "send", to, message };
   }
 
-  const callMatch = cmd.match(/^call\s+([^\s]+)$/i);
-  if (callMatch) {
-    const to = normalizeE164(callMatch[1]);
+  // Spanish send: Fred manda/envía/responde/dile a +52...: mensaje
+  m = cmd.match(/^(?:manda(?:r)?|env[ií]a|responde(?:r)?|dile)\s+(?:a\s+)?([^:|\s]+)\s*[:|]\s*(.+)$/i);
+  if (m) {
+    const to = normalizeE164(m[1]);
+    const message = m[2]?.trim();
+    if (!to || !message) return { ok: false, reason: "invalid_send_args" };
+    return { ok: true, action: "send", to, message };
+  }
+
+  // English call: Fred call +52...
+  m = cmd.match(/^call\s+(.+)$/i);
+  if (m) {
+    const to = normalizeE164(m[1]);
     if (!to) return { ok: false, reason: "invalid_call_target" };
     return { ok: true, action: "call", to };
   }
 
-  const endCallMatch = cmd.match(/^(?:endcall|hangup)\s+([A-Za-z0-9]+)$/i);
-  if (endCallMatch) {
-    return { ok: true, action: "endcall", callSid: endCallMatch[1] };
+  // Spanish call: Fred marcale a +52... / llama a +52...
+  m = cmd.match(/^(?:m[aá]rcale|marcar|ll[aá]male|llama)\s+(?:a\s+)?(.+)$/i);
+  if (m) {
+    const to = normalizeE164(m[1]);
+    if (!to) return { ok: false, reason: "invalid_call_target" };
+    return { ok: true, action: "call", to };
+  }
+
+  // End call: Fred endcall CAXXX / Fred cuelga CAXXX
+  m = cmd.match(/^(?:endcall|hangup|cuelga|termina(?:r)?\s+llamada)\s+([A-Za-z0-9]+)$/i);
+  if (m) {
+    return { ok: true, action: "endcall", callSid: m[1] };
   }
 
   return { ok: false, reason: "unknown_command" };
 }
-
 async function twilioRequest(pathname, params) {
   const sid = process.env.TWILIO_ACCOUNT_SID?.trim();
   const token = process.env.TWILIO_AUTH_TOKEN?.trim();
