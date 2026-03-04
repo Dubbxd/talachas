@@ -1379,6 +1379,9 @@ function normalizeE164(raw) {
 const WA_COMMANDS_ENABLED = String(process.env.WA_COMMANDS_ENABLED || "false").toLowerCase() === "true";
 const WA_COMMAND_PREFIX = (process.env.WA_COMMAND_PREFIX || "Fred").trim();
 const WA_OWNER_E164 = normalizeE164(process.env.WA_OWNER_E164 || "");
+const WA_GLOBAL_CHAT_ENABLED = String(process.env.WA_GLOBAL_CHAT_ENABLED || "true").toLowerCase() === "true";
+const WA_GLOBAL_CHAT_AGENT = (process.env.WA_GLOBAL_CHAT_AGENT || "main").trim() || "main";
+const WA_GLOBAL_CHAT_TIMEOUT_MS = Number(process.env.WA_GLOBAL_CHAT_TIMEOUT_MS || 180000);
 const WA_AUDIT_LOG_PATH =
   process.env.WA_AUDIT_LOG_PATH?.trim() || path.join(STATE_DIR, "wa-command-audit.log");
 
@@ -1407,14 +1410,29 @@ function waSenderFromBody(body) {
   );
 }
 
-function parseFredCommand(text) {
+function fredPrefixRegex() {
+  return new RegExp(`^${WA_COMMAND_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+}
+
+function stripFredPrefix(text) {
   const t = String(text || "").trim();
-  if (!t) return { ok: false, reason: "empty" };
+  const rx = fredPrefixRegex();
+  if (!rx.test(t)) return null;
+  return t.replace(rx, "").trim();
+}
 
-  const prefixRegex = new RegExp(`^${WA_COMMAND_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
-  if (!prefixRegex.test(t)) return { ok: false, reason: "prefix_mismatch" };
+function waTargetFromBody(body) {
+  const raw = String(
+    body?.to ?? body?.To ?? body?.recipient ?? body?.chatId ?? body?.conversationId ?? body?.remoteJid ?? "",
+  ).trim();
+  if (!raw) return null;
+  if (/@g\.us$/i.test(raw) || /@s\.whatsapp\.net$/i.test(raw)) return raw;
+  return normalizeE164(raw);
+}
 
-  const cmd = t.replace(prefixRegex, "").trim();
+function parseFredCommand(text) {
+  const cmd = stripFredPrefix(text);
+  if (cmd === null) return { ok: false, reason: "prefix_mismatch" };
   if (!cmd) return { ok: false, reason: "empty_after_prefix" };
 
   // English explicit send: Fred send +52... | mensaje
@@ -1524,6 +1542,29 @@ async function executeFredCommand(parsed) {
   throw new Error(`Unsupported action: ${parsed.action}`);
 }
 
+async function executeFredGlobalConversation(prompt, target) {
+  if (!WA_GLOBAL_CHAT_ENABLED) throw new Error("global_chat_disabled");
+  if (!target) throw new Error("missing_target");
+  const args = [
+    "agent",
+    "--agent",
+    WA_GLOBAL_CHAT_AGENT,
+    "--to",
+    target,
+    "--message",
+    prompt,
+    "--deliver",
+  ];
+  const r = await runCmd("openclaw", args, {
+    cwd: WORKSPACE_DIR,
+    timeoutMs: Number.isFinite(WA_GLOBAL_CHAT_TIMEOUT_MS) ? WA_GLOBAL_CHAT_TIMEOUT_MS : 180000,
+  });
+  if ((r.code ?? 1) !== 0) {
+    throw new Error(`agent_deliver_failed(${r.code}): ${String(r.output || "").slice(0, 800)}`);
+  }
+  return { action: "agent", target, code: r.code ?? 0 };
+}
+
 // Public WhatsApp command webhook:
 // executes owner-only commands sent from the same WhatsApp account (fromMe=true).
 // Unknown/invalid commands are safe no-op (204).
@@ -1547,6 +1588,21 @@ app.post("/whatsapp/webhook", async (req, res) => {
 
   const parsed = parseFredCommand(text);
   if (!parsed.ok) {
+    if (parsed.reason === "unknown_command" && WA_GLOBAL_CHAT_ENABLED) {
+      const prompt = stripFredPrefix(text);
+      const target = waTargetFromBody(body);
+      if (!prompt || !target) {
+        waAudit({ scope: "fred", accepted: false, reason: !prompt ? "empty_after_prefix" : "missing_target", sender, target, textPreview: text.slice(0, 120) });
+        return res.status(204).end();
+      }
+      try {
+        const result = await executeFredGlobalConversation(prompt, target);
+        waAudit({ scope: "fred", accepted: true, sender, target, command: "agent", result });
+      } catch (err) {
+        waAudit({ scope: "fred", accepted: false, sender, target, command: "agent", reason: "execution_error", error: String(err) });
+      }
+      return res.status(204).end();
+    }
     waAudit({ scope: "fred", accepted: false, reason: parsed.reason, sender, textPreview: text.slice(0, 120) });
     return res.status(204).end();
   }
@@ -1627,6 +1683,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
   console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
   console.log(`[wrapper] wa commands: ${WA_COMMANDS_ENABLED ? "enabled" : "disabled"}, prefix=${WA_COMMAND_PREFIX}`);
+  console.log(`[wrapper] wa global chat: ${WA_GLOBAL_CHAT_ENABLED ? "enabled" : "disabled"}, agent=${WA_GLOBAL_CHAT_AGENT}`);
   if (WA_COMMANDS_ENABLED && !WA_OWNER_E164) {
     console.warn("[wrapper] WARNING: WA_COMMANDS_ENABLED=true but WA_OWNER_E164 is missing/invalid. Commands will be ignored.");
   }

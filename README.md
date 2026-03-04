@@ -119,6 +119,9 @@ Variables nuevas (Railway):
 - `WA_COMMANDS_ENABLED=true`
 - `WA_COMMAND_PREFIX=Fred`
 - `WA_OWNER_E164=+34600111222` (formato E.164 estricto)
+- `WA_GLOBAL_CHAT_ENABLED=true` (si `Fred ...` no es comando explícito, se trata como prompt conversacional)
+- `WA_GLOBAL_CHAT_AGENT=main` (agente OpenClaw que responderá)
+- `WA_GLOBAL_CHAT_TIMEOUT_MS=180000`
 - `WA_AUDIT_LOG_PATH=/data/.openclaw/wa-command-audit.log` (opcional)
 - `TWILIO_ACCOUNT_SID=...`
 - `TWILIO_AUTH_TOKEN=...`
@@ -130,9 +133,13 @@ Comandos soportados:
 - `Fred call +34600111222`
 - `Fred endcall CA1234567890abcdef...` (o `Fred hangup <CallSid>`)
 
+Modo conversación global:
+- `Fred <cualquier prompt>`
+- Si no coincide con comandos explícitos, el wrapper invoca `openclaw agent --deliver` y responde en el mismo chat objetivo.
+
 Comportamiento de seguridad:
 - Si no cumple owner/prefijo/formato: **no-op seguro** (`204`)
-- Comando desconocido: **no-op seguro** (`204`)
+- Comando desconocido con modo global deshabilitado: **no-op seguro** (`204`)
 - Todo intento queda auditado en JSONL en `WA_AUDIT_LOG_PATH`
 
 ## Troubleshooting
